@@ -48,12 +48,13 @@ class SumTree(object):
     tree, but is a little more user-friendly.
     """
 
-    def __init__(self, capacity):
+    def __init__(self, capacity, nodes=None):
         """Creates the sum tree data structure for the given replay capacity.
 
         Args:
           capacity: int, the maximum number of elements that can be stored in this
             data structure.
+          nodes: storage list for storing nodes
 
         Raises:
           ValueError: If requested capacity is not positive.
@@ -63,7 +64,7 @@ class SumTree(object):
             raise ValueError('Sum tree capacity should be positive. Got: {}'.
                              format(capacity))
 
-        self.nodes = []
+        self.nodes = [] if nodes is None else nodes
         tree_depth = int(math.ceil(np.log2(capacity)))
         level_size = 1
         for _ in range(tree_depth + 1):
@@ -183,10 +184,17 @@ class SumTree(object):
 
         delta_value = value - self.nodes[-1][node_index]
 
-        # Now traverse back the tree, adjusting all sums along the way.
-        for nodes_at_this_depth in reversed(self.nodes):
-            # Note: Adding a delta leads to some tolerable numerical inaccuracies.
+        # # Now traverse back the tree, adjusting all sums along the way.
+        # for nodes_at_this_depth in reversed(self.nodes):
+        #     # Note: Adding a delta leads to some tolerable numerical inaccuracies.
+        #     nodes_at_this_depth[node_index] += delta_value
+        #     self.nodes[]
+        #     node_index //= 2
+
+        for nodes_at_this_depth_idx in reversed(range(len(self.nodes))):
+            nodes_at_this_depth = self.nodes[nodes_at_this_depth_idx]
             nodes_at_this_depth[node_index] += delta_value
+            self.nodes[nodes_at_this_depth_idx] = nodes_at_this_depth
             node_index //= 2
 
         assert node_index == 0, ('Sum tree traversal failed, final node index '

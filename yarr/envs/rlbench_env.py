@@ -6,13 +6,16 @@ try:
 except (ModuleNotFoundError, ImportError) as e:
     print("You need to install RLBench: 'https://github.com/stepjam/RLBench'")
     raise e
-from rlbench.action_modes import ActionMode
+from rlbench.action_modes.action_mode import ActionMode
 from rlbench.backend.observation import Observation
 from rlbench.backend.task import Task
+
+from clip import tokenize
 
 from yarr.envs.env import Env, MultiTaskEnv
 from yarr.utils.observation_type import ObservationElement
 from yarr.utils.transition import Transition
+from yarr.utils.process_str import change_case
 
 
 ROBOT_STATE_KEYS = ['joint_velocities', 'joint_positions', 'joint_forces',
@@ -37,6 +40,7 @@ def _extract_obs(obs: Observation, channels_last: bool, observation_config):
         obs_dict = {k: v if v.ndim == 3 else np.expand_dims(v, -1)
                     for k, v in obs_dict.items()}
     obs_dict['low_dim_state'] = np.array(robot_state, dtype=np.float32)
+    obs_dict['ignore_collisions'] = np.array([obs.ignore_collisions], dtype=np.float32)
     for (k, v) in [(k, v) for k, v in obs_dict.items() if 'point_cloud' in k]:
         obs_dict[k] = v.astype(np.float32)
 
@@ -118,18 +122,24 @@ class RLBenchEnv(Env):
                  action_mode: ActionMode,
                  dataset_root: str = '',
                  channels_last=False,
-                 headless=True):
+                 headless=True,
+                 include_lang_goal_in_obs=False):
         super(RLBenchEnv, self).__init__()
         self._task_class = task_class
         self._observation_config = observation_config
         self._channels_last = channels_last
+        self._include_lang_goal_in_obs = include_lang_goal_in_obs
         self._rlbench_env = Environment(
             action_mode=action_mode, obs_config=observation_config,
             dataset_root=dataset_root, headless=headless)
         self._task = None
+        self._lang_goal = 'unknown goal'
 
     def extract_obs(self, obs: Observation):
-        return _extract_obs(obs, self._channels_last, self._observation_config)
+        extracted_obs = _extract_obs(obs, self._channels_last, self._observation_config)
+        if self._include_lang_goal_in_obs:
+            extracted_obs['lang_goal_tokens'] = tokenize([self._lang_goal])[0].numpy()
+        return extracted_obs
 
     def launch(self):
         self._rlbench_env.launch()
@@ -140,7 +150,9 @@ class RLBenchEnv(Env):
 
     def reset(self) -> dict:
         descriptions, obs = self._task.reset()
-        return self.extract_obs(obs)
+        self._lang_goal = descriptions[0] # first description variant
+        extracted_obs = self.extract_obs(obs)
+        return extracted_obs
 
     def step(self, action: np.ndarray) -> Transition:
         obs, reward, terminal = self._task.step(action)
@@ -160,7 +172,6 @@ class RLBenchEnv(Env):
         return self._rlbench_env
 
 
-
 class MultiTaskRLBenchEnv(MultiTaskEnv):
 
     def __init__(self,
@@ -170,26 +181,47 @@ class MultiTaskRLBenchEnv(MultiTaskEnv):
                  dataset_root: str = '',
                  channels_last=False,
                  headless=True,
-                 swap_task_every: int = 1):
+                 swap_task_every: int = 1,
+                 include_lang_goal_in_obs=False):
         super(MultiTaskRLBenchEnv, self).__init__()
         self._task_classes = task_classes
         self._observation_config = observation_config
         self._channels_last = channels_last
+        self._include_lang_goal_in_obs = include_lang_goal_in_obs
         self._rlbench_env = Environment(
             action_mode=action_mode, obs_config=observation_config,
             dataset_root=dataset_root, headless=headless)
         self._task = None
+        self._task_name = ''
+        self._lang_goal = 'unknown goal'
         self._swap_task_every = swap_task_every
         self._rlbench_env
         self._episodes_this_task = 0
+        self._active_task_id = -1
 
-    def _set_new_task(self):
-        self._active_task_id = np.random.randint(0, len(self._task_classes))
+        self._task_name_to_idx = {change_case(tc.__name__):i for i, tc in enumerate(self._task_classes)}
+
+    def _set_new_task(self, shuffle=False):
+        if shuffle:
+            self._active_task_id = np.random.randint(0, len(self._task_classes))
+        else:
+            self._active_task_id = (self._active_task_id + 1) % len(self._task_classes)
         task = self._task_classes[self._active_task_id]
         self._task = self._rlbench_env.get_task(task)
 
+    def set_task(self, task_name: str):
+        self._active_task_id = self._task_name_to_idx[task_name]
+        task = self._task_classes[self._active_task_id]
+        self._task = self._rlbench_env.get_task(task)
+
+        descriptions, _ = self._task.reset()
+        self._lang_goal = descriptions[0] # first description variant
+
     def extract_obs(self, obs: Observation):
-        return _extract_obs(obs, self._channels_last, self._observation_config)
+        extracted_obs = _extract_obs(obs, self._channels_last, self._observation_config)
+        if self._include_lang_goal_in_obs:
+            extracted_obs['lang_goal_tokens'] = tokenize([self._lang_goal])[0].numpy()
+        return extracted_obs
 
     def launch(self):
         self._rlbench_env.launch()
@@ -199,13 +231,16 @@ class MultiTaskRLBenchEnv(MultiTaskEnv):
         self._rlbench_env.shutdown()
 
     def reset(self) -> dict:
-        self._episodes_this_task += 1
         if self._episodes_this_task == self._swap_task_every:
             self._set_new_task()
             self._episodes_this_task = 0
+        self._episodes_this_task += 1
 
         descriptions, obs = self._task.reset()
-        return self.extract_obs(obs)
+        self._lang_goal = descriptions[0] # first description variant
+        extracted_obs = self.extract_obs(obs)
+
+        return extracted_obs
 
     def step(self, action: np.ndarray) -> Transition:
         obs, reward, terminal = self._task.step(action)

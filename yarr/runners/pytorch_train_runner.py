@@ -10,9 +10,11 @@ from multiprocessing import Lock
 from typing import Optional, List
 from typing import Union
 
+import gc
 import numpy as np
 import psutil
 import torch
+import pandas as pd
 from yarr.agents.agent import Agent
 from yarr.replay_buffer.wrappers.pytorch_replay_buffer import \
     PyTorchReplayBuffer
@@ -20,8 +22,9 @@ from yarr.runners.env_runner import EnvRunner
 from yarr.runners.train_runner import TrainRunner
 from yarr.utils.log_writer import LogWriter
 from yarr.utils.stat_accumulator import StatAccumulator
+from yarr.replay_buffer.prioritized_replay_buffer import PrioritizedReplayBuffer
 
-NUM_WEIGHTS_TO_KEEP = 10
+NUM_WEIGHTS_TO_KEEP = 60
 
 
 class PyTorchTrainRunner(TrainRunner):
@@ -35,6 +38,9 @@ class PyTorchTrainRunner(TrainRunner):
                  replay_buffer_sample_rates: List[float] = None,
                  stat_accumulator: Union[StatAccumulator, None] = None,
                  iterations: int = int(1e6),
+                 num_train_envs: int = 1,
+                 num_eval_envs: int = 1,
+                 eval_episodes: int = 10,
                  logdir: str = '/tmp/yarr/logs',
                  log_freq: int = 10,
                  transitions_before_train: int = 1000,
@@ -43,8 +49,16 @@ class PyTorchTrainRunner(TrainRunner):
                  replay_ratio: Optional[float] = None,
                  tensorboard_logging: bool = True,
                  csv_logging: bool = False,
-                 buffers_per_batch: int = -1  # -1 = all
-                 ):
+                 wandb_logging: bool = False,
+                 wandb_project: str = None,
+                 wandb_entity: str = None,
+                 wandb_group: str = None,
+                 wandb_name: str = None,
+                 wandb_tags=None,
+                 wandb_mode: str = None,
+                 wandb_config: dict = None,
+                 buffers_per_batch: int = -1,  # -1 = all
+                 load_existing_weights: bool = True):
         super(PyTorchTrainRunner, self).__init__(
             agent, env_runner, wrapped_replay_buffer,
             stat_accumulator,
@@ -68,6 +82,11 @@ class PyTorchTrainRunner(TrainRunner):
         self._train_device = train_device
         self._tensorboard_logging = tensorboard_logging
         self._csv_logging = csv_logging
+        self._wandb_logging = wandb_logging
+        self._num_train_envs = num_train_envs
+        self._num_eval_envs = num_eval_envs
+        self._eval_episodes = eval_episodes
+        self._load_existing_weights = load_existing_weights
 
         if replay_ratio is not None and replay_ratio < 0:
             raise ValueError("max_replay_ratio must be positive.")
@@ -78,7 +97,17 @@ class PyTorchTrainRunner(TrainRunner):
             logging.info("'logdir' was None. No logging will take place.")
         else:
             self._writer = LogWriter(
-                self._logdir, tensorboard_logging, csv_logging)
+                self._logdir,
+                tensorboard_logging,
+                csv_logging,
+                wandb_logging=wandb_logging,
+                wandb_project=wandb_project,
+                wandb_entity=wandb_entity,
+                wandb_group=wandb_group,
+                wandb_name=wandb_name,
+                wandb_tags=wandb_tags,
+                wandb_mode=wandb_mode,
+                wandb_config=wandb_config)
         if weightsdir is None:
             logging.info(
                 "'weightsdir' was None. No weight saving will take place.")
@@ -99,22 +128,19 @@ class PyTorchTrainRunner(TrainRunner):
 
     def _step(self, i, sampled_batch):
         update_dict = self._agent.update(i, sampled_batch)
-        if "priority" in update_dict:
-            priority = update_dict['priority'].cpu().detach().numpy() if isinstance(update_dict['priority'], torch.Tensor) else np.numpy(update_dict['priority'])
-        else:
-            priority = None
+        priority = update_dict['priority'].cpu().detach().numpy() if isinstance(update_dict['priority'], torch.Tensor) else np.numpy(update_dict['priority'])
         indices = sampled_batch['indices'].cpu().detach().numpy()
         acc_bs = 0
         for wb_idx, wb in enumerate(self._wrapped_buffer):
             bs = wb.replay_buffer.batch_size
             if 'priority' in update_dict:
                 indices_ = indices[:, wb_idx]
-                if hasattr(wb, "replay_buffer"):
-                    if len(priority.shape) > 1:
-                        priority_ = priority[:, wb_idx]
-                    else:
-                        # legacy version
-                        priority_ = priority[acc_bs: acc_bs + bs]
+                if len(priority.shape) > 1:
+                    priority_ = priority[:, wb_idx]
+                else:
+                    # legacy version
+                    priority_ = priority[acc_bs: acc_bs + bs]
+                if isinstance(wb.replay_buffer, PrioritizedReplayBuffer):
                     wb.replay_buffer.set_priority(indices_, priority_)
             acc_bs += bs
 
@@ -135,6 +161,16 @@ class PyTorchTrainRunner(TrainRunner):
         return sum([
             r.replay_buffer.add_count for r in self._wrapped_buffer])
 
+    def _get_resume_eval_epoch(self):
+        starting_epoch = 0
+        eval_csv_file = self._weightsdir.replace('weights', 'eval_data.csv') # TODO(mohit): check if it's supposed be 'env_data.csv'
+        if os.path.exists(eval_csv_file):
+             eval_dict = pd.read_csv(eval_csv_file).to_dict()
+             epochs = list(eval_dict['step'].values())
+             return epochs[-1] if len(epochs) > 0 else starting_epoch
+        else:
+            return starting_epoch
+
     def start(self):
 
         signal.signal(signal.SIGINT, self._signal_handler)
@@ -148,7 +184,21 @@ class PyTorchTrainRunner(TrainRunner):
         self._agent.build(training=True, device=self._train_device)
 
         if self._weightsdir is not None:
-            self._save_model(0)  # Save weights so workers can load.
+            existing_weights = sorted([int(f) for f in os.listdir(self._weightsdir)])
+            if (not self._load_existing_weights) or len(existing_weights) == 0:
+                self._save_model(0)
+                start_iter = 0
+            else:
+                resume_iteration = existing_weights[-1]
+                self._agent.load_weights(os.path.join(self._weightsdir, str(resume_iteration)))
+                start_iter = resume_iteration + 1
+                print(f"Resuming training from iteration {resume_iteration} ...")
+
+                if self._num_eval_envs > 0:
+                    eval_epoch = self._get_resume_eval_epoch()
+                    self._env_runner.set_eval_epochs(eval_epoch)
+                    self._writer.set_resumed_from_prev_run(True)
+                    print(f"Resuming evaluation from epoch {eval_epoch} ...")
 
         while (np.any(self._get_add_counts() < self._transitions_before_train)):
             time.sleep(1)
@@ -165,10 +215,14 @@ class PyTorchTrainRunner(TrainRunner):
         process = psutil.Process(os.getpid())
         num_cpu = psutil.cpu_count()
 
-        for i in range(self._iterations):
+        for i in range(start_iter, self._iterations):
             self._env_runner.set_step(i)
 
-            log_iteration = i % self._log_freq == 0 and i > 0
+            if self._num_train_envs > 0 or self._num_eval_envs == 0:
+                log_iteration = i % self._log_freq == 0 and i > 0
+            else:
+                num_eval_episodes = self._env_runner._num_eval_episodes_signal.value
+                log_iteration = self._env_runner._eval_report_signal.value and num_eval_episodes > 0
 
             if log_iteration:
                 process.cpu_percent(interval=None)
@@ -213,11 +267,16 @@ class PyTorchTrainRunner(TrainRunner):
 
             if log_iteration and self._writer is not None:
                 replay_ratio = get_replay_ratio()
-                logging.info('Step %d. Sample time: %s. Step time: %s. Replay ratio: %s.' % (
-                             i, sample_time, step_time, replay_ratio))
+                logging.info('Train Step %d. Eval Epoch %d. Sample time: %s. Step time: %s. Replay ratio: %s.' % (
+                    i, self._env_runner._eval_epochs_signal.value, sample_time, step_time, replay_ratio))
                 agent_summaries = self._agent.update_summaries()
                 env_summaries = self._env_runner.summaries()
-                self._writer.add_summaries(i, agent_summaries + env_summaries)
+
+                # agent summaries
+                self._writer.add_summaries(i, agent_summaries)
+
+                # env summaries
+                self._writer.add_summaries(self._env_runner._eval_epochs_signal.value, env_summaries)
 
                 for r_i, wrapped_buffer in enumerate(self._wrapped_buffer):
                     self._writer.add_scalar(
@@ -250,6 +309,8 @@ class PyTorchTrainRunner(TrainRunner):
                     i, 'monitoring/cpu_percent',
                     process.cpu_percent(interval=None) / num_cpu)
 
+                self._env_runner.set_eval_report(False)
+
             self._writer.end_iteration()
 
             if i % self._save_freq == 0 and self._weightsdir is not None:
@@ -261,3 +322,4 @@ class PyTorchTrainRunner(TrainRunner):
         logging.info('Stopping envs ...')
         self._env_runner.stop()
         [r.replay_buffer.shutdown() for r in self._wrapped_buffer]
+

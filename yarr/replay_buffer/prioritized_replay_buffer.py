@@ -59,18 +59,24 @@ class PrioritizedReplayBuffer(UniformReplayBuffer):
                 priority = self._sum_tree.max_recorded_priority
 
             if self._disk_saving:
-                self._store[TERMINAL][cursor] = kwargs[TERMINAL]
+                term = self._store[TERMINAL]
+                term[cursor] = kwargs[TERMINAL]
+                self._store[TERMINAL] = term
+
                 with open(join(self._save_dir, '%d.replay' % cursor), 'wb') as f:
                     pickle.dump(kwargs, f)
                 # If first add, then pad for correct wrapping
-                if self._add_count == 0:
+                if self._add_count.value == 0:
                     self._add_initial_to_disk(kwargs)
             else:
                 for name, data in kwargs.items():
-                    self._store[name][cursor] = data
+                    item = self._store[name]
+                    item[cursor] = data
+                    self._store[name] = item
+
 
             self._sum_tree.set(self.cursor(), priority)
-            self._add_count += 1
+            self._add_count.value += 1
             self.invalid_range = invalid_range(
                 self.cursor(), self._replay_capacity, self._timesteps,
                 self._update_horizon)
@@ -80,8 +86,8 @@ class PrioritizedReplayBuffer(UniformReplayBuffer):
         Args:
           **kwargs: The remaining args
         """
-        if self.is_empty() or self._store['terminal'][self.cursor() - 1] != 1:
-            raise ValueError('The previous transition was not terminal.')
+        # if self.is_empty() or self._store['terminal'][self.cursor() - 1] != 1:
+        #     raise ValueError('The previous transition was not terminal.')
         self._check_add_types(kwargs, self._obs_signature)
         transition = self._final_transition(kwargs)
         for element_type in self._storage_signature:

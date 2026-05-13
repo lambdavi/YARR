@@ -9,11 +9,6 @@ from yarr.agents.agent import ScalarSummary, HistogramSummary, ImageSummary, \
     VideoSummary, TextSummary
 from torch.utils.tensorboard import SummaryWriter
 
-try:
-    import wandb
-except ImportError:
-    wandb = None
-
 
 class LogWriter(object):
 
@@ -21,40 +16,13 @@ class LogWriter(object):
                  logdir: str,
                  tensorboard_logging: bool,
                  csv_logging: bool,
-                 wandb_logging: bool = False,
-                 wandb_project: str = None,
-                 wandb_entity: str = None,
-                 wandb_group: str = None,
-                 wandb_name: str = None,
-                 wandb_tags=None,
-                 wandb_mode: str = None,
-                 wandb_config: dict = None,
                  train_csv: str = 'train_data.csv',
                  env_csv: str = 'env_data.csv'):
         self._tensorboard_logging = tensorboard_logging
         self._csv_logging = csv_logging
-        self._wandb_logging = wandb_logging
         os.makedirs(logdir, exist_ok=True)
         if tensorboard_logging:
             self._tf_writer = SummaryWriter(logdir)
-        if wandb_logging:
-            if wandb is None:
-                logging.warning("wandb_logging=True but wandb is not installed. Disabling wandb logging.")
-                self._wandb_logging = False
-            else:
-                init_kwargs = {
-                    'project': wandb_project,
-                    'entity': wandb_entity,
-                    'group': wandb_group,
-                    'name': wandb_name,
-                    'dir': logdir,
-                    'tags': list(wandb_tags) if wandb_tags is not None else None,
-                    'config': wandb_config,
-                }
-                if wandb_mode is not None:
-                    init_kwargs['mode'] = wandb_mode
-                init_kwargs = {k: v for k, v in init_kwargs.items() if v is not None}
-                wandb.init(**init_kwargs)
         if csv_logging:
             self._train_prev_row_data = self._train_row_data = OrderedDict()
             self._train_csv_file = os.path.join(logdir, train_csv)
@@ -66,12 +34,6 @@ class LogWriter(object):
     def add_scalar(self, i, name, value):
         if self._tensorboard_logging:
             self._tf_writer.add_scalar(name, value, i)
-        if self._wandb_logging:
-            v = value.item() if isinstance(value, torch.Tensor) else value
-            if isinstance(i, (int, np.integer)):
-                wandb.log({name: v}, step=int(i))
-            else:
-                wandb.log({name: v})
         if self._csv_logging:
             if 'env' in name or 'eval' in name or 'test' in name:
                 if len(self._env_row_data) == 0:
@@ -83,22 +45,6 @@ class LogWriter(object):
                     self._train_row_data['step'] = i
                 self._train_row_data[name] = value.item() if isinstance(
                     value, torch.Tensor) else value
-
-    @staticmethod
-    def _infer_image_dataformat(img):
-        """Infer TensorBoard image format for 2D/3D numpy or torch arrays."""
-        shape = img.shape
-        if len(shape) == 2:
-            return 'HW'
-        if len(shape) != 3:
-            # Fallback for unexpected shapes.
-            return 'CHW'
-
-        c_first = shape[0] in (1, 3, 4)
-        c_last = shape[2] in (1, 3, 4)
-        if c_last and not c_first:
-            return 'HWC'
-        return 'CHW'
 
     def add_summaries(self, i, summaries):
         for summary in summaries:
@@ -113,9 +59,7 @@ class LogWriter(object):
                         # Only grab first item in batch
                         v = (summary.value if summary.value.ndim == 3 else
                              summary.value[0])
-                        dataformats = self._infer_image_dataformat(v)
-                        self._tf_writer.add_image(
-                            summary.name, v, i, dataformats=dataformats)
+                        self._tf_writer.add_image(summary.name, v, i)
                     elif isinstance(summary, VideoSummary):
                         # Only grab first item in batch
                         v = (summary.value if summary.value.ndim == 5 else
@@ -124,27 +68,6 @@ class LogWriter(object):
                             summary.name, v, i, fps=summary.fps)
                     elif isinstance(summary, TextSummary):
                         self._tf_writer.add_text(summary.name, summary.value, i)
-                if self._wandb_logging:
-                    if isinstance(summary, HistogramSummary):
-                        payload = {summary.name: wandb.Histogram(summary.value)}
-                    elif isinstance(summary, ImageSummary):
-                        v = (summary.value if summary.value.ndim == 3 else
-                             summary.value[0])
-                        payload = {summary.name: wandb.Image(v)}
-                    elif isinstance(summary, VideoSummary):
-                        v = (summary.value if summary.value.ndim == 5 else
-                             np.array([summary.value]))
-                        payload = {summary.name: wandb.Video(v, fps=summary.fps, format='mp4')}
-                    elif isinstance(summary, TextSummary):
-                        payload = {summary.name: str(summary.value)}
-                    else:
-                        payload = None
-
-                    if payload is not None:
-                        if isinstance(i, (int, np.integer)):
-                            wandb.log(payload, step=int(i))
-                        else:
-                            wandb.log(payload)
             except Exception as e:
                 logging.error('Error on summary: %s' % summary.name)
                 raise e
@@ -203,6 +126,3 @@ class LogWriter(object):
     def close(self):
         if self._tensorboard_logging:
             self._tf_writer.close()
-        if self._wandb_logging:
-            wandb.finish()
-

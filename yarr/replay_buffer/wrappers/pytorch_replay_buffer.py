@@ -1,5 +1,5 @@
 import time
-from threading import Lock, Thread
+from threading import Thread
 
 from torch.utils.data import IterableDataset, DataLoader
 
@@ -72,8 +72,11 @@ class PyTorchReplayBuffer(WrappedReplayBuffer):
         super(PyTorchReplayBuffer, self).__init__(replay_buffer)
         self._num_workers = num_workers
 
-    def dataset(self) -> DataLoader:
-        # d = PyTorchIterableReplayDataset(self._replay_buffer, self._num_workers)
+    def dataset(self, batch_size=None, drop_last=False) -> DataLoader:
+        # d = PyTorchIterableReplayDataset(self._replay_buffer)
         d = PyTorchIterableReplayDataset(self._replay_buffer)
+
         # Batch size None disables automatic batching
-        return DataLoader(d, batch_size=None, pin_memory=True)
+        return DataLoader(d, batch_size=batch_size,
+                          drop_last=drop_last,
+                          num_workers=self._num_workers, pin_memory=True)

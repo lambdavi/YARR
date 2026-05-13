@@ -17,8 +17,8 @@ from yarr.envs.env import Env
 from yarr.replay_buffer.replay_buffer import ReplayBuffer
 from yarr.runners._env_runner import _EnvRunner
 from yarr.utils.rollout_generator import RolloutGenerator
-from yarr.utils.stat_accumulator import StatAccumulator
-
+from yarr.utils.stat_accumulator import StatAccumulator, SimpleAccumulator
+from yarr.utils.process_str import change_case
 
 class EnvRunner(object):
 
@@ -28,26 +28,44 @@ class EnvRunner(object):
                  train_replay_buffer: Union[ReplayBuffer, List[ReplayBuffer]],
                  num_train_envs: int,
                  num_eval_envs: int,
-                 episodes: int,
+                 rollout_episodes: int,
+                 eval_episodes: int,
+                 training_iterations: int,
+                 eval_from_eps_number: int,
                  episode_length: int,
                  eval_env: Union[Env, None] = None,
                  eval_replay_buffer: Union[ReplayBuffer, List[ReplayBuffer], None] = None,
                  stat_accumulator: Union[StatAccumulator, None] = None,
                  rollout_generator: RolloutGenerator = None,
                  weightsdir: str = None,
+                 logdir: str = None,
                  max_fails: int = 10,
-                 env_device: torch.device = None):
+                 num_eval_runs: int = 1,
+                 env_device: torch.device = None,
+                 multi_task: bool = False,
+                 rollout_timesteps: int = None):
         self._train_env = train_env
         self._eval_env = eval_env if eval_env else train_env
         self._agent = agent
         self._train_envs = num_train_envs
         self._eval_envs = num_eval_envs
         self._train_replay_buffer = train_replay_buffer if isinstance(train_replay_buffer, list) else [train_replay_buffer]
-        self._timesteps = self._train_replay_buffer[0].timesteps
+        if self._train_replay_buffer[0] is not None:
+            self._timesteps = self._train_replay_buffer[0].timesteps
+        elif rollout_timesteps is not None and int(rollout_timesteps) > 0:
+            # Offline eval (no train replay): match training stack depth, e.g. replay.timesteps.
+            self._timesteps = int(rollout_timesteps)
+        else:
+            self._timesteps = 1
+
         if eval_replay_buffer is not None:
             eval_replay_buffer = eval_replay_buffer if isinstance(eval_replay_buffer, list) else [eval_replay_buffer]
         self._eval_replay_buffer = eval_replay_buffer
-        self._episodes = episodes
+        self._rollout_episodes = rollout_episodes
+        self._eval_episodes = eval_episodes
+        self._num_eval_runs = num_eval_runs
+        self._training_iterations = training_iterations
+        self._eval_from_eps_number = eval_from_eps_number
         self._episode_length = episode_length
         self._stat_accumulator = stat_accumulator
         self._rollout_generator = (
@@ -55,17 +73,23 @@ class EnvRunner(object):
             else rollout_generator)
         self._rollout_generator._env_device = env_device
         self._weightsdir = weightsdir
+        self._logdir = logdir
         self._max_fails = max_fails
         self._env_device = env_device
         self._previous_loaded_weight_folder = ''
         self._p = None
         self._kill_signal = Value('b', 0)
         self._step_signal = Value('i', -1)
+        self._num_eval_episodes_signal = Value('i', 0)
+        self._eval_epochs_signal = Value('i', 0)
+        self._eval_report_signal = Value('b', 0)
         self._new_transitions = {'train_envs': 0, 'eval_envs': 0}
         self._total_transitions = {'train_envs': 0, 'eval_envs': 0}
         self.log_freq = 1000  # Will get overridden later
         self.target_replay_ratio = None  # Will get overridden later
         self.current_replay_ratio = Value('f', -1)
+        self._current_task_id = -1
+        self._multi_task = multi_task
 
     def summaries(self) -> List[Summary]:
         summaries = []
@@ -77,6 +101,25 @@ class EnvRunner(object):
             summaries.append(ScalarSummary('%s/total_transitions' % key, value))
         self._new_transitions = {'train_envs': 0, 'eval_envs': 0}
         summaries.extend(self._agent_summaries)
+
+        # add current task_name to eval summaries .... argh this should be inside a helper function
+        if hasattr(self._eval_env, '_task_class'):
+            eval_task_name = change_case(self._eval_env._task_class.__name__)
+        elif hasattr(self._eval_env, '_task_classes'):
+            if self._current_task_id != -1:
+                task_id = (self._current_task_id) % len(self._eval_env._task_classes)
+                eval_task_name = change_case(self._eval_env._task_classes[task_id].__name__)
+            else:
+                eval_task_name = ''
+        else:
+            raise Exception('Neither task_class nor task_classes found in eval env')
+
+        # multi-task summaries
+        if eval_task_name and self._multi_task:
+            for s in summaries:
+                if 'eval' in s.name:
+                    s.name = '%s/%s' % (s.name, eval_task_name)
+
         return summaries
 
     def _update(self):
@@ -85,7 +128,7 @@ class EnvRunner(object):
         with self._internal_env_runner.write_lock:
             self._agent_summaries = list(
                 self._internal_env_runner.agent_summaries)
-            if self._step_signal.value % self.log_freq == 0 and self._step_signal.value > 0:
+            if self._num_eval_episodes_signal.value % self._eval_episodes == 0 and self._num_eval_episodes_signal.value > 0:
                 self._internal_env_runner.agent_summaries[:] = []
             for name, transition, eval in self._internal_env_runner.stored_transitions:
                 add_to_buffer = (not eval) or self._eval_replay_buffer is not None
@@ -107,16 +150,22 @@ class EnvRunner(object):
                     'eval_envs' if eval else 'train_envs'] += 1
                 if self._stat_accumulator is not None:
                     self._stat_accumulator.step(transition, eval)
+                self._current_task_id = transition.info["active_task_id"] if eval else -1
             self._internal_env_runner.stored_transitions[:] = []  # Clear list
         return new_transitions
 
     def _run(self, save_load_lock):
         self._internal_env_runner = _EnvRunner(
             self._train_env, self._eval_env, self._agent, self._timesteps, self._train_envs,
-            self._eval_envs, self._episodes, self._episode_length, self._kill_signal,
-            self._step_signal, self._rollout_generator, save_load_lock,
+            self._eval_envs, self._rollout_episodes, self._eval_episodes,
+            self._training_iterations, self._eval_from_eps_number, self._episode_length, self._kill_signal,
+            self._step_signal, self._num_eval_episodes_signal,
+            self._eval_epochs_signal, self._eval_report_signal,
+            self.log_freq, self._rollout_generator, save_load_lock,
             self.current_replay_ratio, self.target_replay_ratio,
-            self._weightsdir, self._env_device)
+            self._weightsdir, self._logdir,
+            self._env_device, self._previous_loaded_weight_folder,
+            num_eval_runs=self._num_eval_runs)
         training_envs = self._internal_env_runner.spin_up_envs('train_env', self._train_envs, False)
         eval_envs = self._internal_env_runner.spin_up_envs('eval_env', self._eval_envs, True)
         envs = training_envs + eval_envs
@@ -144,7 +193,7 @@ class EnvRunner(object):
                         no_transitions[p.name] += 1
                     else:
                         no_transitions[p.name] = 0
-                    if no_transitions[p.name] > 600:  # 5min
+                    if no_transitions[p.name] > 1200: #600:  # 10min
                         logging.warning("Env %s hangs, so restarting" % p.name)
                         envs.remove(p)
                         os.kill(p.pid, signal.SIGTERM)
@@ -172,3 +221,10 @@ class EnvRunner(object):
 
     def set_step(self, step):
         self._step_signal.value = step
+
+    def set_eval_report(self, report):
+        self._eval_report_signal.value = report
+
+    def set_eval_epochs(self, epochs):
+        self._eval_epochs_signal.value = epochs
+

@@ -20,6 +20,10 @@ class ImageSummary(Summary):
     pass
 
 
+class TextSummary(Summary):
+    pass
+
+
 class VideoSummary(Summary):
     def __init__(self, name: str, value: Any, fps: int = 30):
         super(VideoSummary, self).__init__(name, value)

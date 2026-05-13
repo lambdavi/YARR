@@ -6,6 +6,7 @@ i.e. where rewards are accumulated for n steps and the intermediate trajectory
 is not exposed to the agent. This does not allow, for example, performing
 off-policy corrections.
 """
+import ctypes
 import collections
 import concurrent.futures
 import os
@@ -15,6 +16,7 @@ from typing import List, Tuple, Type
 import time
 import math
 # from threading import Lock
+import multiprocessing as mp
 from multiprocessing import Lock
 import numpy as np
 import logging
@@ -23,6 +25,8 @@ from natsort import natsort
 
 from yarr.replay_buffer.replay_buffer import ReplayBuffer, ReplayElement
 from yarr.utils.observation_type import ObservationElement
+
+import torch.distributed as dist
 
 # Defines a type describing part of the tuple returned by the replay
 # memory. Each element of the tuple is a tensor of shape [batch, ...] where
@@ -98,7 +102,9 @@ class UniformReplayBuffer(ReplayBuffer):
                  observation_elements: List[ObservationElement] = None,
                  extra_replay_elements: List[ReplayElement] = None,
                  save_dir: str = None,
-                 purge_replay_on_shutdown: bool = True
+                 purge_replay_on_shutdown: bool = True,
+                 num_replicas: int = None,
+                 rank: int = None,
                  ):
         """Initializes OutOfGraphReplayBuffer.
 
@@ -125,6 +131,22 @@ class UniformReplayBuffer(ReplayBuffer):
           ValueError: If replay_capacity is too small to hold at least one
             transition.
         """
+        if num_replicas is None:
+            if not dist.is_available():
+                raise RuntimeError("Requires distributed package to be available")
+            self._num_replicas = dist.get_world_size()
+        else:
+            self._num_replicas = int(num_replicas)
+        if rank is None:
+            if not dist.is_available():
+                raise RuntimeError("Requires distributed package to be available")
+            self._rank = dist.get_rank()
+        else:
+            self._rank = int(rank)
+        if self._rank >= self._num_replicas or self._rank < 0:
+            raise ValueError(
+                "Invalid rank {}, rank should be in the interval"
+                " [0, {}]".format(self._rank, self._num_replicas - 1))
 
         if observation_elements is None:
             observation_elements = []
@@ -172,7 +194,7 @@ class UniformReplayBuffer(ReplayBuffer):
         self._create_storage()
 
         self._lock = Lock()
-        self._add_count = np.array(0)
+        self._add_count = mp.Value('i', 0)
 
         self._replay_capacity = replay_capacity
 
@@ -196,10 +218,10 @@ class UniformReplayBuffer(ReplayBuffer):
     def batch_size(self):
         return self._batch_size
 
-    def _create_storage(self):
+    def _create_storage(self, store=None):
         """Creates the numpy arrays used to store transitions.
         """
-        self._store = {}
+        self._store = {} if store is None else store
         for storage_element in self._storage_signature:
             array_shape = [self._replay_capacity] + list(storage_element.shape)
             if storage_element.name == TERMINAL:
@@ -223,7 +245,7 @@ class UniformReplayBuffer(ReplayBuffer):
             ReplayElement(ACTION, self._action_shape, self._action_dtype),
             ReplayElement(REWARD, self._reward_shape, self._reward_dtype),
             ReplayElement(TERMINAL, (), np.int8),
-            ReplayElement(TIMEOUT, (), np.bool),
+            ReplayElement(TIMEOUT, (), bool),
         ]
 
         obs_elements = []
@@ -260,9 +282,9 @@ class UniformReplayBuffer(ReplayBuffer):
         """
 
         # If previous transition was a terminal, then add_final wasn't called
-        if not self.is_empty() and self._store['terminal'][self.cursor() - 1] == 1:
-            raise ValueError('The previous transition was a terminal, '
-                             'but add_final was not called.')
+        # if not self.is_empty() and self._store['terminal'][self.cursor() - 1] == 1:
+        #     raise ValueError('The previous transition was a terminal, '
+        #                      'but add_final was not called.')
 
         kwargs[ACTION] = action
         kwargs[REWARD] = reward
@@ -276,8 +298,8 @@ class UniformReplayBuffer(ReplayBuffer):
         Args:
           **kwargs: The remaining args
         """
-        if self.is_empty() or self._store['terminal'][self.cursor() - 1] != 1:
-            raise ValueError('The previous transition was not terminal.')
+        # if self.is_empty() or self._store['terminal'][self.cursor() - 1] != 1:
+        #     raise ValueError('The previous transition was not terminal.')
         self._check_add_types(kwargs, self._obs_signature)
         transition = self._final_transition(kwargs)
         self._add(transition)
@@ -311,17 +333,21 @@ class UniformReplayBuffer(ReplayBuffer):
             cursor = self.cursor()
 
             if self._disk_saving:
-                self._store[TERMINAL][cursor] = kwargs[TERMINAL]
+                term = self._store[TERMINAL]
+                term[cursor] = kwargs[TERMINAL]
+                self._store[TERMINAL] = term
                 with open(join(self._save_dir, '%d.replay' % cursor), 'wb') as f:
                     pickle.dump(kwargs, f)
                 # If first add, then pad for correct wrapping
-                if self._add_count == 0:
+                if self._add_count.value == 0:
                     self._add_initial_to_disk(kwargs)
             else:
                 for name, data in kwargs.items():
-                    self._store[name][cursor] = data
-
-            self._add_count += 1
+                    item = self._store[name]
+                    item[cursor] = data
+                    self._store[name] = item
+            with self._add_count.get_lock():
+                self._add_count.value += 1
             self.invalid_range = invalid_range(
                 self.cursor(), self._replay_capacity, self._timesteps,
                 self._update_horizon)
@@ -398,23 +424,27 @@ class UniformReplayBuffer(ReplayBuffer):
 
     def is_empty(self):
         """Is the Replay Buffer empty?"""
-        return self._add_count == 0
+        return self._add_count.value == 0
 
     def is_full(self):
         """Is the Replay Buffer full?"""
-        return self._add_count >= self._replay_capacity
+        return self._add_count.value >= self._replay_capacity
 
     def cursor(self):
         """Index to the location where the next transition will be written."""
-        return self._add_count % self._replay_capacity
+        return self._add_count.value % self._replay_capacity
 
     @property
     def add_count(self):
-        return self._add_count.copy()
+        return np.array(self._add_count.value)
 
     @add_count.setter
-    def add_count(self, count: int):
-        self._add_count = np.array(count)
+    def add_count(self, count):
+        if isinstance(count, int):
+            self._add_count = mp.Value('i', count)
+        else:
+            self._add_count = count
+
 
     def get_range(self, array, start_index, end_index):
         """Returns the range of array at the index handling wraparound if necessary.
@@ -498,9 +528,10 @@ class UniformReplayBuffer(ReplayBuffer):
         return state
 
     def get_terminal_stack(self, index):
-        return self.get_range(self._store[TERMINAL],
+        terminal_stack = self.get_range(self._store[TERMINAL],
                               index - self._timesteps + 1,
                               index + 1)
+        return terminal_stack
 
     def is_valid_transition(self, index):
         """Checks if the index contains a valid transition.
@@ -666,7 +697,7 @@ class UniformReplayBuffer(ReplayBuffer):
                 else:
                     # np.argmax of a bool array returns index of the first True.
                     trajectory_length = np.argmax(
-                        trajectory_terminals.astype(np.bool),
+                        trajectory_terminals.astype(bool),
                         0) + 1
 
                 next_state_index = state_index + trajectory_length
@@ -719,6 +750,13 @@ class UniformReplayBuffer(ReplayBuffer):
         if pack_in_dict:
             batch_arrays = self.unpack_transition(
                 batch_arrays, transition_elements)
+
+        # TODO(Mohit): proper fix to discard task names
+        if 'task' in batch_arrays:
+            del batch_arrays['task']
+        if 'task_tp1' in batch_arrays:
+            del batch_arrays['task_tp1']
+
         return batch_arrays
 
     def get_transition_elements(self, batch_size=None):
@@ -738,7 +776,7 @@ class UniformReplayBuffer(ReplayBuffer):
             ReplayElement(REWARD, (batch_size,) + self._reward_shape,
                           self._reward_dtype),
             ReplayElement(TERMINAL, (batch_size,), np.int8),
-            ReplayElement(TIMEOUT, (batch_size,), np.bool),
+            ReplayElement(TIMEOUT, (batch_size,), bool),
             ReplayElement(INDICES, (batch_size,), np.int32),
         ]
 
@@ -768,3 +806,4 @@ class UniformReplayBuffer(ReplayBuffer):
 
     def using_disk(self):
         return self._disk_saving
+
