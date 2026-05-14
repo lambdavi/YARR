@@ -51,7 +51,10 @@ class OfflineTrainRunner():
                  wandb_config: dict = None,
                  load_existing_weights: bool = True,
                  rank: int = None,
-                 world_size: int = None):
+                 world_size: int = None,
+                 val_wrapped_replay_buffer: Optional[PyTorchReplayBuffer] = None,
+                 val_loss_freq: int = 0,
+                 val_loss_batches: int = 8):
         self._agent = agent
         self._wrapped_buffer = wrapped_replay_buffer
         self._stat_accumulator = stat_accumulator
@@ -71,6 +74,10 @@ class OfflineTrainRunner():
         self._load_existing_weights = load_existing_weights
         self._rank = rank
         self._world_size = world_size
+
+        self._val_wrapped = val_wrapped_replay_buffer
+        self._val_loss_freq = int(val_loss_freq or 0)
+        self._val_loss_batches = max(1, int(val_loss_batches))
 
         self._writer = None
         if logdir is None:
@@ -141,6 +148,14 @@ class OfflineTrainRunner():
         dataset = self._wrapped_buffer.dataset()
         data_iter = iter(dataset)
 
+        val_data_iter = None
+        if (
+            self._val_wrapped is not None
+            and self._val_loss_freq > 0
+            and hasattr(self._agent, "compute_validation_loss")
+        ):
+            val_data_iter = iter(self._val_wrapped.dataset())
+
         process = psutil.Process(os.getpid())
         num_cpu = psutil.cpu_count()
 
@@ -162,6 +177,12 @@ class OfflineTrainRunner():
             step_time = time.time() - t
 
             if self._rank == 0:
+                run_val = (
+                    val_data_iter is not None
+                    and self._val_loss_freq > 0
+                    and i > 0
+                    and i % self._val_loss_freq == 0
+                )
                 if log_iteration and self._writer is not None:
                     agent_summaries = self._agent.update_summaries()
                     self._writer.add_summaries(i, agent_summaries)
@@ -175,7 +196,41 @@ class OfflineTrainRunner():
 
                     logging.info(f"Train Step {i:06d} | Loss: {loss:0.5f} | Sample time: {sample_time:0.6f} | Step time: {step_time:0.4f}.")
 
-                self._writer.end_iteration()
+                if run_val and self._writer is not None:
+                    n_b = self._val_loss_batches
+                    totals = []
+                    sub_keys = None
+                    sub_sums = None
+                    for _ in range(n_b):
+                        sampled_val = next(val_data_iter)
+                        vbatch = {
+                            k: v.to(self._train_device)
+                            for k, v in sampled_val.items()
+                            if isinstance(v, torch.Tensor)
+                        }
+                        if "lang_goal" in sampled_val:
+                            vbatch["lang_goal"] = sampled_val["lang_goal"]
+                        vout = self._agent.compute_validation_loss(vbatch)
+                        totals.append(vout["total_loss"])
+                        if sub_keys is None:
+                            sub_keys = [k for k in vout if k.startswith("losses/")]
+                            sub_sums = {k: 0.0 for k in sub_keys}
+                        for k in sub_keys:
+                            sub_sums[k] += vout[k]
+                    mean_val = float(sum(totals) / len(totals))
+                    self._writer.add_scalar(i, "val_diffusion/total_loss", mean_val)
+                    for k in sub_keys:
+                        short = k.replace("losses/", "")
+                        self._writer.add_scalar(
+                            i, f"val_diffusion/{short}", sub_sums[k] / n_b
+                        )
+                    logging.info(
+                        "Train Step %06d | val_diffusion/total_loss: %0.5f (%d batches).",
+                        i, mean_val, n_b,
+                    )
+
+                if self._writer is not None:
+                    self._writer.end_iteration()
 
                 if i % self._save_freq == 0 and self._weightsdir is not None:
                     self._save_model(i)
@@ -185,4 +240,6 @@ class OfflineTrainRunner():
             logging.info('Stopping envs ...')
 
             self._wrapped_buffer.replay_buffer.shutdown()
+            if self._val_wrapped is not None:
+                self._val_wrapped.replay_buffer.shutdown()
 
