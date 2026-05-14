@@ -59,12 +59,10 @@ class PrioritizedReplayBuffer(UniformReplayBuffer):
                 priority = self._sum_tree.max_recorded_priority
 
             if self._disk_saving:
-                term = self._store[TERMINAL]
-                term[cursor] = kwargs[TERMINAL]
-                self._store[TERMINAL] = term
+                self._store[TERMINAL][cursor] = kwargs[TERMINAL]
 
                 with open(join(self._save_dir, '%d.replay' % cursor), 'wb') as f:
-                    pickle.dump(kwargs, f)
+                    pickle.dump(kwargs, f, protocol=pickle.HIGHEST_PROTOCOL)
                 # If first add, then pad for correct wrapping
                 if self._add_count.value == 0:
                     self._add_initial_to_disk(kwargs)

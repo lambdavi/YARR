@@ -321,7 +321,7 @@ class UniformReplayBuffer(ReplayBuffer):
         for i in range(self._timesteps - 1):
             with open(join(self._save_dir, '%d.replay' % (
                     self._replay_capacity - 1 - i)), 'wb') as f:
-                pickle.dump(kwargs, f)
+                pickle.dump(kwargs, f, protocol=pickle.HIGHEST_PROTOCOL)
 
     def _add(self, kwargs: dict):
         """Internal add method to add to the storage arrays.
@@ -333,11 +333,9 @@ class UniformReplayBuffer(ReplayBuffer):
             cursor = self.cursor()
 
             if self._disk_saving:
-                term = self._store[TERMINAL]
-                term[cursor] = kwargs[TERMINAL]
-                self._store[TERMINAL] = term
+                self._store[TERMINAL][cursor] = kwargs[TERMINAL]
                 with open(join(self._save_dir, '%d.replay' % cursor), 'wb') as f:
-                    pickle.dump(kwargs, f)
+                    pickle.dump(kwargs, f, protocol=pickle.HIGHEST_PROTOCOL)
                 # If first add, then pad for correct wrapping
                 if self._add_count.value == 0:
                     self._add_initial_to_disk(kwargs)
