@@ -133,6 +133,11 @@ class OfflineTrainRunner():
         self._agent = copy.deepcopy(self._agent)
         self._agent.build(training=True, device=self._train_device)
 
+        if self._rank == 0 and self._writer is not None:
+            param_fn = getattr(self._agent, "wandb_parameter_summary", None)
+            if callable(param_fn):
+                self._writer.wandb_update_summary(param_fn())
+
         if self._weightsdir is not None:
             existing_weights = sorted([int(f) for f in os.listdir(self._weightsdir)])
             if (not self._load_existing_weights) or len(existing_weights) == 0:

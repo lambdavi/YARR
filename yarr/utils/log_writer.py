@@ -34,6 +34,7 @@ class LogWriter(object):
         self._tensorboard_logging = tensorboard_logging
         self._csv_logging = csv_logging
         self._wandb_logging = wandb_logging
+        self._wandb = None
         os.makedirs(logdir, exist_ok=True)
         if tensorboard_logging:
             self._tf_writer = SummaryWriter(logdir)
@@ -55,6 +56,7 @@ class LogWriter(object):
                     init_kwargs['mode'] = wandb_mode
                 init_kwargs = {k: v for k, v in init_kwargs.items() if v is not None}
                 wandb.init(**init_kwargs)
+                self._wandb = wandb
         if csv_logging:
             self._train_prev_row_data = self._train_row_data = OrderedDict()
             self._train_csv_file = os.path.join(logdir, train_csv)
@@ -62,6 +64,14 @@ class LogWriter(object):
             self._env_csv_file = os.path.join(logdir, env_csv)
             self._train_field_names = None
             self._env_field_names = None
+
+    def wandb_update_summary(self, metrics: dict, log_step: int = 0):
+        """Record one-time metrics in wandb summary and optionally at a training step."""
+        if not self._wandb_logging or self._wandb is None:
+            return
+        self._wandb.summary.update(metrics)
+        if log_step is not None:
+            self._wandb.log(dict(metrics), step=int(log_step))
 
     def add_scalar(self, i, name, value):
         if self._tensorboard_logging:
